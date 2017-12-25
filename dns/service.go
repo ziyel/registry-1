@@ -19,13 +19,93 @@ import (
 const (
 	resType       = "machine"
 	domainSuffix  = "."
+	domainPrefix  = "_"
 	matchIPPrefix = "10."
 	purgeInterval = 2
 )
 
+// Service provides DNS service.
+type Service struct {
+	enable bool
+	port   int
+	conf   config.DNSConfig
+	server *dnslib.Server
+
+	mu    sync.RWMutex
+	cache map[string][]dnslib.RR
+
+	wmu        sync.RWMutex
+	checkWorks map[string]*CheckWorker
+
+	tree tree.TreeMethod
+
+	logger *log.Logger
+}
+
+// New DNS service
+func New(c config.DNSConfig, cluster httpd.Cluster) (*Service, error) {
+	tree, err := tree.NewTree(cluster)
+	if err != nil {
+		log.Errorf("init tree fail: %s", err.Error())
+		return nil, err
+	}
+	return &Service{
+		enable:     c.Enable,
+		port:       c.Port,
+		conf:       c,
+		server:     &dnslib.Server{Addr: ":" + strconv.Itoa(c.Port), Net: "udp"},
+		cache:      make(map[string][]dnslib.RR),
+		checkWorks: make(map[string]*CheckWorker),
+		tree:       tree,
+
+		logger: log.New("INFO", "dns", model.LogBackend),
+	}, nil
+}
+
+// Start DNS service
+func (s *Service) Start() error {
+	if !s.enable {
+		s.logger.Info("DNS module not enable")
+		return nil
+	}
+	// attach request handler func
+	dnslib.HandleFunc("loda.", s.handleDNSRequest)
+
+	// start server
+	s.logger.Infof("Starting DNS module at %d", s.port)
+	go func() {
+		err := s.server.ListenAndServe()
+		if err != nil {
+			s.logger.Errorf("Failed to start DNS service: %s", err.Error())
+		}
+	}()
+	go s.purgeCache()
+	return nil
+}
+
+// Close DNS service
+func (s *Service) Close() error {
+	return s.server.Shutdown()
+}
+
 func (s *Service) parseQuery(m *dnslib.Msg) {
 	machines := func(s *Service, ns string, domain string) []dnslib.RR {
 		var res []dnslib.RR
+		var port int
+		var err error
+		// port handler
+		if strings.HasPrefix(ns, domainPrefix) {
+			portns := strings.SplitAfterN(ns, domainSuffix, 2)
+			if len(portns) < 2 {
+				return res
+			}
+			ns = portns[1]
+			port, err = strconv.Atoi(strings.TrimSuffix(strings.TrimPrefix(portns[0], domainPrefix), domainSuffix))
+			if err != nil {
+				s.logger.Errorf("parse port to int failed: %s %s", err, portns[0])
+				return res
+			}
+		}
 		resList, err := s.tree.GetResourceList(ns, resType)
 		if err != nil {
 			s.logger.Errorf("DNS search failed: %s", err)
@@ -41,10 +121,25 @@ func (s *Service) parseQuery(m *dnslib.Msg) {
 				iparray = append(iparray, strings.Split(ips, ",")...)
 			}
 		}
-
-		for _, ip := range removeRepByMap(iparray) {
-			// only return prefix matched IPs
-			if ip != "" && strings.HasPrefix(ip, matchIPPrefix) {
+		uniqIPArray := removeRepByMap(iparray)
+		// health status check
+		if port != 0 {
+			// health status do not support more than 200
+			if len(uniqIPArray) > 200 {
+				return res
+			}
+			w, err := NewCheckWork(domain, uniqIPArray, port, s)
+			if err != nil {
+				s.logger.Errorf("new check worker failed:%s", err)
+				return res
+			}
+			res = w.Check()
+			s.wmu.Lock()
+			s.checkWorks[domain] = w
+			go w.Run()
+			s.wmu.Unlock()
+		} else {
+			for _, ip := range uniqIPArray {
 				rr, err := dnslib.NewRR(fmt.Sprintf("%s A %s", domain, ip))
 				if err == nil {
 					rr.Header().Ttl = 60
@@ -90,66 +185,6 @@ func (s *Service) handleDNSRequest(w dnslib.ResponseWriter, r *dnslib.Msg) {
 	w.WriteMsg(m)
 }
 
-// Service provides DNS service.
-type Service struct {
-	enable bool
-	port   int
-	conf   config.DNSConfig
-	server *dnslib.Server
-
-	mu    sync.RWMutex
-	cache map[string][]dnslib.RR
-
-	tree tree.TreeMethod
-
-	logger *log.Logger
-}
-
-// New DNS service
-func New(c config.DNSConfig, cluster httpd.Cluster) (*Service, error) {
-	tree, err := tree.NewTree(cluster)
-	if err != nil {
-		log.Errorf("init tree fail: %s", err.Error())
-		return nil, err
-	}
-	return &Service{
-		enable: c.Enable,
-		port:   c.Port,
-		conf:   c,
-		server: &dnslib.Server{Addr: ":" + strconv.Itoa(c.Port), Net: "udp"},
-		cache:  make(map[string][]dnslib.RR),
-		tree:   tree,
-
-		logger: log.New("INFO", "dns", model.LogBackend),
-	}, nil
-}
-
-// Start DNS service
-func (s *Service) Start() error {
-	if !s.enable {
-		s.logger.Info("DNS module not enable")
-		return nil
-	}
-	// attach request handler func
-	dnslib.HandleFunc("loda.", s.handleDNSRequest)
-
-	// start server
-	s.logger.Infof("Starting DNS module at %d", s.port)
-	go func() {
-		err := s.server.ListenAndServe()
-		if err != nil {
-			s.logger.Errorf("Failed to start DNS service: %s", err.Error())
-		}
-	}()
-	go s.purgeCache()
-	return nil
-}
-
-// Close DNS service
-func (s *Service) Close() error {
-	return s.server.Shutdown()
-}
-
 func (s *Service) purgeCache() {
 	ticker := time.NewTicker(time.Duration(purgeInterval) * time.Minute)
 	for {
@@ -166,6 +201,10 @@ func removeRepByMap(slc []string) []string {
 	var result []string
 	tempMap := map[string]byte{}
 	for _, e := range slc {
+		//IP filter
+		if e == "" || !strings.HasPrefix(e, matchIPPrefix) {
+			continue
+		}
 		l := len(tempMap)
 		tempMap[e] = 0
 		if len(tempMap) != l {
